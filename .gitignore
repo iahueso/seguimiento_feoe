@@ -1,0 +1,21 @@
+# --- Credenciales y sesión: NUNCA subir ---
+.env
+session.json
+
+# --- Datos de alumnos generados por los scripts: NUNCA subir ---
+*.png
+*.csv
+*.html
+revision_alumno*/
+informes/
+datos.json
+
+# --- Entorno de Python ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# --- Varios ---
+*.log
+.DS_Store
