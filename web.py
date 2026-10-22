@@ -498,7 +498,10 @@ EXTRACT_JS = r"""
     return {
       campo: labelFor(el),
       tipo: type,
-      valor: clean(value),
+      // En textos largos se respetan los saltos de línea
+      valor: type === "textarea"
+        ? (value || "").replace(/[ \t]+/g, " ").replace(/ *\n\s*/g, "\n").trim()
+        : clean(value),
       obligatorio: el.required || el.getAttribute("aria-required") === "true",
       invalido: el.validity ? !el.validity.valid : false,
       desactivado: el.disabled,

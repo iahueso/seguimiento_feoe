@@ -13,7 +13,7 @@ Los scripts **solo leen**: nunca pulsan Guardar, Eliminar ni Imprimir.
 |---|---|
 | `probar_login.py` | Comprueba que entra en la web y pulsa los botones de `WEB_CLICK_DESPUES` |
 | `ver_alumnos.py` | Muestra la lista de alumnos del Cuaderno de seguimiento (y la guarda en `alumnos.csv`) |
-| `revisar_tutorias.py` | Revisa la tutoría más próxima de un alumno y envía el resumen por Telegram/WhatsApp |
+| `revisar_tutorias.py` | Revisa a todos los alumnos (próxima tutoría + desarrollos asociados) y envía un mensaje de Telegram por alumno |
 | `notificar.py` | Envía mensajes; `python notificar.py --chat-id` te da tu `TELEGRAM_CHAT_ID` |
 | `informe.py` | Genera un informe HTML de los formularios de una página |
 | `web.py` | Funciones comunes (login, clics, lectura de formularios y tablas) |
@@ -39,8 +39,9 @@ En `.env` rellena al menos `WEB_LOGIN_URL`, `WEB_USER`, `WEB_PASSWORD`,
 
 ```bash
 python3 probar_login.py                         # comprobar el acceso
-python3 revisar_tutorias.py                     # 1er alumno, tutoría más próxima a partir de hoy
-python3 revisar_tutorias.py --alumno 3          # otro alumno
+python3 revisar_tutorias.py                     # todos los alumnos: un mensaje de Telegram por alumno
+python3 revisar_tutorias.py --alumno 3          # solo un alumno
+python3 revisar_tutorias.py --sin-enviar        # solo mostrarlo en pantalla, sin enviar
 python3 revisar_tutorias.py --fecha 10/10/2026  # como si hoy fuera ese día
 python3 revisar_tutorias.py --todas             # todas sus tutorías
 python3 revisar_tutorias.py --oculto            # sin abrir la ventana del navegador
@@ -56,5 +57,5 @@ python3 revisar_tutorias.py --oculto            # sin abrir la ventana del naveg
 ## Privacidad
 
 `.env` (credenciales), `session.json`, las capturas, los CSV y las carpetas
-`revision_alumno*` contienen datos sensibles o de alumnos y están excluidos en
+`revision/` y `revision_alumno*` contienen datos sensibles o de alumnos y están excluidos en
 `.gitignore`. No los subas nunca al repositorio.
