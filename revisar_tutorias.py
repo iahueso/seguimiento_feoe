@@ -411,20 +411,40 @@ def page_lines(text: str) -> list[str]:
     return [l.strip() for l in (text or "").splitlines() if l.strip()]
 
 
-async def find_button(page: Page, text: str, ms: int = 2500):
+CLICKABLE_JS = """e => {
+  const c = e.closest('a, button, input[type=button], input[type=submit], input[type=image], [onclick], [role=button]');
+  return c ? (c.tagName.toLowerCase() + (c.id ? '#' + c.id : '') + ' «' + (c.innerText || c.value || c.title || '').trim().slice(0, 40) + '»') : '';
+}"""
+
+
+async def find_button(page: Page, text: str, ms: int = 4000):
+    """Busca el botón/enlace con ese texto, prefiriendo elementos que se pueden pulsar
+    (no un título o un texto suelto que diga lo mismo). Devuelve (elemento, descripción)."""
     for _ in range(max(1, ms // 500)):
-        el = await web._find_visible(page, text)
-        if el:
-            return el
+        try:
+            matches = await web._all_visible_matches(page, text)
+        except Exception:
+            matches = []
+        for _box, el in matches:
+            try:
+                desc = await el.evaluate(CLICKABLE_JS)
+            except Exception:
+                continue
+            if desc:
+                return el, desc
+        el = await web._find_visible(page, text)      # último recurso: lo que haya con ese texto
+        if el and not matches:
+            return el, "(elemento sin enlace)"
         await page.wait_for_timeout(500)
-    return None
+    return None, ""
 
 
 async def read_desarrollos(page: Page, outdir: Path):
     """Pulsa "Desarrollos asociados" si está en esta página y devuelve (texto, página_resultado).
     texto = None si el botón no está aquí; "" si está pero no hay texto."""
-    el = await find_button(page, DESARROLLOS)
+    el, desc = await find_button(page, DESARROLLOS)
     if not el:
+        log.info("No veo '%s' en %s", DESARROLLOS, page.url)
         if SOLO_DES:
             print(f"   🔎 No veo '{DESARROLLOS}' en: {await page.title()}  ({page.url})")
             botones = await web.list_clickables(page)
@@ -434,53 +454,135 @@ async def read_desarrollos(page: Page, outdir: Path):
                     print(f"        - {b}")
         return None, page
     forms_before, _, before = await read_page(page)
+    url_before = page.url
     before_vals = {(c["valor"] or "").strip() for f in forms_before for c in f["campos"]}
-    log.info("Pulsando '%s'", DESARROLLOS)
+    log.info("Pulsando '%s': %s", DESARROLLOS, desc)
+    fp_before = await web._fingerprint(page)
     target = await click_follow(page, el)
+    if target is page and await web._fingerprint(page) == fp_before:
+        # No ha pasado nada: se repite el clic por JavaScript (ejecuta el onclick directamente)
+        log.info("La página no ha cambiado; repito el clic en '%s'", DESARROLLOS)
+        try:
+            await el.evaluate("e => (e.closest('a, button, input, [onclick]') || e).click()")
+        except Exception:
+            pass
+        await page.wait_for_timeout(1500)
+        await web._settle(page)
+        if page.context.pages[-1] is not page:            # se ha abierto en ventana nueva
+            target = page.context.pages[-1]
+            await web._settle(target)
+    # ¿Se ha abierto dentro de la misma página (capa/ventanita)? Entonces hay que quitar lo que ya estaba.
+    misma = target is page and target.url == url_before
+
+    # El texto puede cargarse un poco después: se reintenta unos segundos si sale vacío.
+    texto, forms, tables, after = "", [], [], ""
+    for intento in range(4):
+        forms, tables, after = await read_page(target)
+        headers = await table_headers(target)
+        texto = extract_desarrollos(forms, tables, after, before, before_vals, misma, headers)
+        if texto:
+            break
+        await target.wait_for_timeout(1500)
     await target.screenshot(path=str(outdir / "desarrollos.png"), full_page=True)
-    forms, tables, after = await read_page(target)
+    log.info("Desarrollos leídos en %s → %s", target.url,
+             f"{len(texto)} caracteres" if texto else "sin texto")
+
+    # Lo leído se guarda para poder revisarlo si algo no cuadra
+    campos_txt = [c for f in forms for c in f["campos"] if c["tipo"] in ("textarea", "text")]
+    (outdir / "desarrollos_leido.txt").write_text(
+        f"URL: {target.url}\nMisma página: {misma}\n\n--- CAMPOS DE TEXTO ---\n"
+        + "\n".join(f"{c['campo'] or '(sin nombre)'}: {c['valor'] or '(vacío)'}" for c in campos_txt)
+        + "\n\n--- TABLAS ---\n"
+        + "\n".join(" | ".join(r) for t in tables for r in t["filas"])
+        + "\n\n--- TEXTO DE LA PÁGINA ---\n" + after
+        + "\n\n--- RESULTADO ---\n" + (texto or "(vacío)"), encoding="utf-8")
+
     if SOLO_DES:
         print(f"   🔎 Tras pulsar, estoy en: {await target.title()}  ({target.url})")
         print(f"      Captura: {(outdir / 'desarrollos.png').resolve()}")
-        nuevos = [l for l in page_lines(after) if l not in set(page_lines(before))]
-        print(f"      Texto nuevo en la pantalla ({len(nuevos)} líneas):")
-        for l in nuevos[:40]:
-            print(f"        | {l[:110]}")
-        campos_txt = [c for f in forms for c in f["campos"] if c["tipo"] in ("textarea", "text")]
+        print(f"      Todo lo leído: {(outdir / 'desarrollos_leido.txt').resolve()}")
         if campos_txt:
             print("      Campos de texto:")
             for c in campos_txt:
                 print(f"        - {c['campo'] or '(sin nombre)'}: {(c['valor'] or '(vacío)')[:110]}")
+    return texto, target
 
-    # Solo lo que es NUEVO respecto a la página anterior (así no se cuelan menús ni cabeceras).
-    # 1º) Campos de texto: si la página tiene un formulario, manda lo que haya en él.
-    campos = [c for f in forms for c in f["campos"]
-              if c["tipo"] in ("textarea", "text")
-              and not NO_NOTA_VALOR_RE.search(c["valor"] or "")
-              and not ((c["valor"] or "").strip() and ((c["valor"] or "").strip() in before_vals
-                                                      or (c["valor"] or "").strip() in before))]
-    if campos:
-        llenos = [c for c in campos if (c["valor"] or "").strip() and not SIN_NOTA_RE.match(c["valor"].strip())]
-        if len(llenos) == 1:
-            return llenos[0]["valor"].strip(), target
-        return "\n".join(f"{c['campo']}: {c['valor'].strip()}" if c["campo"] else c["valor"].strip()
-                         for c in llenos), target
 
-    # 2º) Tablas (sin las celdas que son solo etiquetas tipo "Descripción:")
-    parts = []
+# Textos de las cabeceras de todas las tablas, también de las vacías
+HEADERS_JS = r"""
+() => {
+  const out = [];
+  for (const t of document.querySelectorAll('table')) {
+    const rows = [...t.rows];
+    if (!rows.length) continue;
+    const head = t.querySelector('thead tr') || rows.find(r => r.querySelector('th'))
+                 || (rows.length === 1 ? rows[0] : null);
+    if (head) for (const c of head.cells) { const x = c.innerText.trim(); if (x) out.push(x); }
+  }
+  return out;
+}
+"""
+
+
+async def table_headers(p: Page) -> list[str]:
+    out = []
+    for fr in p.frames:
+        try:
+            out += await fr.evaluate(HEADERS_JS)
+        except Exception:
+            pass
+    return out
+
+
+RUIDO_RE = re.compile(r"^(volver|guardar|aceptar|cancelar|cerrar|imprimir|salir|buscar|nuevo|"
+                      r"a[ñn]adir|editar|eliminar|borrar)$", re.I)
+
+
+def extract_desarrollos(forms, tables, after, before, before_vals, misma, headers=()) -> str:
+    """Saca el texto de los desarrollos: campos rellenos + filas de tablas + (si no hay nada) texto nuevo."""
+    prev = set(page_lines(before))
+
+    def ya_estaba(v):           # solo se filtra si es la misma página (capa/ventanita)
+        return misma and (v in before_vals or v in before)
+
+    # 1) Campos de texto rellenos (los vacíos, como un buscador, se ignoran)
+    campos = []
+    for f in forms:
+        for c in f["campos"]:
+            v = (c["valor"] or "").strip()
+            if (c["tipo"] in ("textarea", "text") and v and not SIN_NOTA_RE.match(v)
+                    and not NO_NOTA_VALOR_RE.search(v) and not ya_estaba(v)):
+                campos.append((c["campo"], v))
+    parts = [f"{k}: {v}" if k and len(campos) > 1 else v for k, v in campos]
+    sp = lambda x: re.sub(r"\s+", " ", x).strip()        # compara sin tener en cuenta saltos de línea
+    vals = sp(" ".join(v for _, v in campos))
+
+    # 2) Filas de tablas (p. ej. una lista de desarrollos)
     for t in tables:
         for row in t["filas"]:
-            cells = [x for x in row if x and not x.endswith(":")]
-            if cells and not all(x in before for x in cells):
+            cells = [x for x in row if x and not x.endswith(":") and not RUIDO_RE.match(x)]
+            if not cells or all(sp(x) in vals for x in cells):
+                continue                      # vacía o ya incluida como campo
+            nueva = not all(x in prev for x in cells)
+            # Si la página es otra, una fila con contenido se guarda aunque también saliera antes
+            con_contenido = not misma and len(cells) >= 2 and len(" ".join(cells)) > 40
+            if nueva or con_contenido:
                 parts.append(" | ".join(cells))
-    # 3º) Si no, el texto nuevo de la página (sin etiquetas ni botones de navegación)
+
+    # 3) Si no hay nada, el texto nuevo de la página (sin las cabeceras de tablas vacías)
     if not parts:
-        prev = set(page_lines(before))
-        ruido = re.compile(r"^(volver|guardar|aceptar|cancelar|cerrar|imprimir|salir)$", re.I)
+        cabeceras = {h.strip().lower() for h in headers if h.strip()}
+        cabeceras |= {h.strip().lower() for t in tables for h in t.get("cabeceras", []) if h.strip()}
+
+        def es_cabecera(l):
+            trozos = [x.strip().lower() for x in re.split(r"\t+|\s{2,}", l) if x.strip()]
+            return bool(trozos) and all(x in cabeceras for x in trozos)
+
         parts = [l for l in page_lines(after)
                  if l not in prev and DESARROLLOS.lower() not in l.lower()
-                 and len(l) > 2 and not l.endswith(":") and not ruido.match(l)]
-    return "\n".join(dict.fromkeys(parts)), target
+                 and len(l) > 2 and not l.endswith(":") and not RUIDO_RE.match(l)
+                 and not es_cabecera(l)]
+    return "\n".join(dict.fromkeys(parts))
 
 
 async def process_student(ses: Sesion, idx: int, first: bool) -> dict:

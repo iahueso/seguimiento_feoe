@@ -1,0 +1,57 @@
+URL: https://aplicaciones.aragon.es/fct/tutoria.desarrollos.do?ID_TUTORIA=925735&ID_ALUMNO=979118&ID_TRAMITACION=1043227
+Misma página: False
+
+--- CAMPOS DE TEXTO ---
+
+
+--- TABLAS ---
+HE HECHO EL DEBUGGING DE UNA HERRAMIENTA DE TRANSCRIPICIÓN QUE HE ESTADO HACIENDO ESTOS DÍAS Y HE TERMINADO LA IMPLEMENTACIÓN DE UNA NUEVA FUNCIÓN PARA RE-TRANSCRIBIR AUDIOS YA TRANSCRITOS. | 22/10/2026 | 4 |  | 
+Páginas: 1 
+
+--- TEXTO DE LA PÁGINA ---
+ v2.0.261
+ 
+Gestión de programas de Formación
+ 
+LUIS HUESO   
+  
+  
+ Cambio Contraseña
+  
+ Desconexión
+   
+ 
+
+
+Detalle del programa
+Empresa: 
+BTS TECHNOLOGY SERVICES, S.A.
+ 
+Alumno/a: 
+GABOR DANIEL
+Centro Trabajo 
+SYSTEM ONE NOC & DEVELOPMENT SOLUTIONS SA (SONOC) IESTM SMR
+ 
+Horas totales
+4
+ 
+Descripción de actividades Desarrolladas
+Descripción	Fecha	Horas	Observaciones Desarrollo	Dificultades Realizacion
+ 
+ Páginas:    1 
+ HE HECHO EL DEBUGGING DE UNA HERRAMIENTA DE TRANSCRIPICIÓN QUE HE ESTADO HACIENDO ESTOS DÍAS Y HE TERMINADO LA IMPLEMENTACIÓN DE UNA NUEVA FUNCIÓN PARA RE-TRANSCRIBIR AUDIOS YA TRANSCRITOS.	 22/10/2026	 4	 	 
+ 
+Cerrar ventana
+
+ 
+
+ 
+ 
+ 
+© Gobierno de Aragón, 2026. Todos los derechos reservados.
+[Contacto servicio F.P.]
+
+
+--- RESULTADO ---
+HE HECHO EL DEBUGGING DE UNA HERRAMIENTA DE TRANSCRIPICIÓN QUE HE ESTADO HACIENDO ESTOS DÍAS Y HE TERMINADO LA IMPLEMENTACIÓN DE UNA NUEVA FUNCIÓN PARA RE-TRANSCRIBIR AUDIOS YA TRANSCRITOS. | 22/10/2026 | 4
+Páginas: 1 

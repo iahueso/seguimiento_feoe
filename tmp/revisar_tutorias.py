@@ -1,24 +1,24 @@
 """
-Entra en un alumno del Cuaderno de seguimiento (icono de la columna "Tutoria"),
-abre cada una de sus tutorías y revisa el contenido del formulario.
+Revisa las prácticas de TODOS los alumnos del Cuaderno de seguimiento y envía
+un mensaje de Telegram por alumno con:
+  - la próxima tutoría (a partir de hoy): ítems con nota y observaciones
+    (o "No hay datos" si está vacía),
+  - el texto de su botón "Desarrollos asociados" (o "No hay texto").
 
 SOLO LEE: nunca pulsa Guardar, Eliminar, Imprimir ni similares, y cancela
 cualquier pregunta de confirmación que haga la web mientras revisa.
 
-Por defecto revisa SOLO la tutoría más próxima a partir de hoy (incluida la de hoy).
-
 Uso:
-  python revisar_tutorias.py                -> primer alumno, navegador a la vista
-  python revisar_tutorias.py --todas        -> revisa todas sus tutorías
+  python revisar_tutorias.py                -> todos los alumnos
+  python revisar_tutorias.py --alumno 3     -> solo el tercer alumno de la lista
+  python revisar_tutorias.py --nombre gabor -> solo el alumno cuyo nombre contenga "gabor"
+  python revisar_tutorias.py --solo-desarrollos  -> solo "Desarrollos asociados", con detalle
+  python revisar_tutorias.py --todas        -> todas las tutorías de cada alumno, no solo la próxima
   python revisar_tutorias.py --fecha 10/10/2026  -> como si hoy fuera ese día (para probar)
-  python revisar_tutorias.py --alumno 3     -> el tercer alumno de la lista
+  python revisar_tutorias.py --sin-enviar   -> no envía nada, solo lo muestra en pantalla
   python revisar_tutorias.py --oculto       -> sin ventana
-  python revisar_tutorias.py "comprueba que todas tengan observaciones"
-                                            -> instrucciones extra para la revisión de la IA
 
-Al terminar envía un resumen por Telegram y/o WhatsApp (ver notificar.py), con
-revisión de la IA si hay ANTHROPIC_API_KEY en .env. Las capturas y datos.json
-quedan en la carpeta revision_alumnoN/.
+Las capturas y datos.json de cada alumno quedan en la carpeta revision/NN/.
 """
 import os
 import re
@@ -34,7 +34,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import web
-import informe
 import notificar
 from playwright.async_api import async_playwright, Page
 
@@ -44,12 +43,19 @@ log = logging.getLogger("tutorias")
 # --- Argumentos ---
 args = sys.argv[1:]
 VISIBLE = "--oculto" not in args
-ALUMNO = 1
+ALUMNO = None                        # None = todos
 if "--alumno" in args:
     i = args.index("--alumno")
     ALUMNO = int(args[i + 1])
     del args[i:i + 2]
 TODAS = "--todas" in args            # revisar todas, no solo la próxima
+SIN_ENVIAR = "--sin-enviar" in args
+SOLO_DES = "--solo-desarrollos" in args   # solo mirar "Desarrollos asociados" (con detalle)
+NOMBRE = None                             # --nombre GABOR: elegir alumno por su nombre
+if "--nombre" in args:
+    i = args.index("--nombre")
+    NOMBRE = args[i + 1]
+    del args[i:i + 2]
 HOY = date.today()
 if "--fecha" in args:                # para probar: --fecha 10/10/2026
     i = args.index("--fecha")
@@ -93,7 +99,9 @@ TUTORIAS = os.getenv("WEB_TUTORIAS", "").strip()
 # Selectores CSS opcionales del icono dentro de la fila, si la detección falla.
 ICONO_ALUMNO = os.getenv("WEB_ICONO_EDITAR", "").strip()
 ICONO_TUTORIA = os.getenv("WEB_ICONO_TUTORIA", "").strip()
-OUT = Path(f"revision_alumno{ALUMNO}")
+# Texto del botón de cada alumno con sus desarrollos asociados.
+DESARROLLOS = os.getenv("WEB_DESARROLLOS", "Desarrollos asociados").strip()
+OUT = Path("revision")
 
 
 # Marca la tabla "principal" de la página: la que tiene más filas de datos con al menos
@@ -250,53 +258,139 @@ async def show_buttons(p: Page, why: str) -> None:
             print(f"     - {b}")
 
 
-async def open_tutorias(browser, first: bool):
-    """Login → Cuaderno → icono "Tutoria" del alumno → lista de tutorías."""
-    ctx = await browser.new_context(locale="es-ES")
-    page = await ctx.new_page()
+# Enlace del menú que lleva a la lista de alumnos (se pulsa para volver a ella).
+MENU_ALUMNOS = os.getenv("WEB_MENU_ALUMNOS", "Cuaderno de seguimiento").strip()
 
-    clicks = await web._login(page)
-    bad = [b for b, r in clicks.items() if r != "ok"]
-    if bad:
-        raise web.WebError(f"No he podido pulsar: {', '.join(bad)}. Prueba antes probar_login.py.")
-    # A partir de aquí no se confirma nada: solo lectura (también en ventanas nuevas).
-    page.remove_listener("dialog", web._accept_dialog)
-    page.on("dialog", safe_dialog)
-    ctx.on("page", lambda p: p.on("dialog", safe_dialog))
 
-    # 1) Lista de alumnos → icono de la columna "Tutoria" del alumno elegido
-    fr, headers, rows = await mark_list(page)
-    if not rows:
-        await page.screenshot(path=str(OUT / "error_lista_alumnos.png"), full_page=True)
-        await show_buttons(page, "No encuentro la lista de alumnos (mira error_lista_alumnos.png).")
-        raise web.WebError("Sin lista de alumnos")
-    if ALUMNO > len(rows):
-        raise web.WebError(f"Has pedido el alumno {ALUMNO} pero solo hay {len(rows)}.")
-    nombre = next((c for c in rows[ALUMNO - 1] if c), f"Alumno {ALUMNO}")
-    res = await fr.evaluate(ICON_JS, [ALUMNO - 1, ICONO_ALUMNO, COL_ALUMNO])
+def _norm(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFD", s or "").encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _names(rows: list) -> list[str]:
+    return [next((c for c in r if c), "") for r in rows]
+
+
+class Sesion:
+    """Una sola sesión en la web para todos los alumnos."""
+
+    def __init__(self, browser):
+        self.browser = browser
+        self.ctx = None
+        self.page = None
+        self.alumnos = None      # nombres de la lista de alumnos (para reconocerla)
+        self.logins = 0
+
+    async def login(self) -> None:
+        if self.ctx:
+            await self.ctx.close()
+        self.ctx = await self.browser.new_context(locale="es-ES")
+        self.page = await self.ctx.new_page()
+        self.logins += 1
+        clicks = await web._login(self.page)
+        bad = [b for b, r in clicks.items() if r != "ok"]
+        if bad:
+            raise web.WebError(f"No he podido pulsar: {', '.join(bad)}. Prueba antes probar_login.py.")
+        # A partir de aquí no se confirma nada: solo lectura (también en ventanas nuevas).
+        self.page.remove_listener("dialog", web._accept_dialog)
+        self.page.on("dialog", safe_dialog)
+        self.ctx.on("page", lambda p: p.on("dialog", safe_dialog))
+
+    async def _clickable_matches(self, text: str):
+        out = []
+        for box, el in await web._all_visible_matches(self.page, text):
+            try:
+                if await el.evaluate("e => !!e.closest('a, button, [onclick], input[type=button], input[type=submit]')"):
+                    out.append((box, el))
+            except Exception:
+                pass
+        return out
+
+    async def _menu_to_students(self) -> bool:
+        """Pulsa "Cuaderno de seguimiento" en el menú (desplegándolo si hace falta)."""
+        m = await self._clickable_matches(MENU_ALUMNOS)
+        if not m:
+            return False
+        if len(m) == 1:
+            # Solo se ve la cabecera del menú: se despliega y se pulsa la opción de debajo
+            head = m[0][0]
+            await click_follow(self.page, m[0][1])
+            m = [x for x in await self._clickable_matches(MENU_ALUMNOS) if not web._overlaps(x[0], head)]
+            if not m:
+                return True
+        log.info("Vuelvo a la lista de alumnos por el menú")
+        await click_follow(self.page, m[-1][1])     # la opción de más abajo (el submenú)
+        return True
+
+    async def _is_students_list(self):
+        fr, headers, rows = await mark_list(self.page)
+        ok = bool(rows) and (self.alumnos is None or _names(rows) == self.alumnos)
+        return ok, fr, headers, rows
+
+    async def ir_a_lista(self):
+        """Deja la página en la lista de alumnos. Devuelve (frame, cabeceras, filas)."""
+        if self.page is None:
+            await self.login()
+        else:
+            for p in list(self.ctx.pages):            # cierra ventanas emergentes que queden
+                if p is not self.page:
+                    await p.close()
+        ok, fr, headers, rows = await self._is_students_list()
+        if not ok:
+            if await self._menu_to_students():
+                ok, fr, headers, rows = await self._is_students_list()
+        if not ok:
+            log.info("No consigo volver a la lista por el menú; inicio sesión de nuevo")
+            await self.login()
+            ok, fr, headers, rows = await self._is_students_list()
+        if not ok:
+            await self.page.screenshot(path=str(OUT / "error_lista_alumnos.png"), full_page=True)
+            await show_buttons(self.page, "No encuentro la lista de alumnos (mira revision/error_lista_alumnos.png).")
+            raise web.WebError("Sin lista de alumnos")
+        if self.alumnos is None:
+            self.alumnos = _names(rows)
+        return fr, headers, rows
+
+    async def close(self):
+        if self.ctx:
+            await self.ctx.close()
+
+
+async def open_tutorias(ses: Sesion, idx: int, outdir: Path, first: bool = False):
+    """Lista de alumnos → icono "Tutoria" del alumno nº idx (0 = primero) → su lista de tutorías.
+    Devuelve (page, nombre, frame, cabeceras, filas_tutorias, nº_alumnos)."""
+    fr, headers, rows = await ses.ir_a_lista()
     if first:
         print(f"\n👥 {len(rows)} alumno(s) en la lista. Columnas: {' | '.join(h for h in headers if h)}")
-        print(f"👤 Alumno {ALUMNO}: {' | '.join(c for c in rows[ALUMNO - 1] if c)}")
+        for k, r in enumerate(rows, 1):
+            print(f"     {k}. {next((c for c in r if c), '')}")
+    if idx >= len(rows):
+        raise web.WebError(f"Has pedido el alumno {idx + 1} pero solo hay {len(rows)}.")
+    nombre = next((c for c in rows[idx] if c), f"Alumno {idx + 1}")
+    res = await fr.evaluate(ICON_JS, [idx, ICONO_ALUMNO, COL_ALUMNO])
     if res.get("error"):
         for i in res.get("info", []):
             print(f"     - {i}")
         raise web.WebError(f"{res['error']}. Revisa WEB_COLUMNA_ALUMNO en .env.")
+    if SOLO_DES:
+        print(f"   🔎 Elementos pulsables en la fila de {nombre}:")
+        for x in res.get("info", []):
+            print(f"        - {x}")
     log.info("Pulsando el icono del alumno: %s", res["picked"])
-    page = await click_follow(page, fr.locator("[data-iw-click]").first)
+    page = await click_follow(ses.page, fr.locator("[data-iw-click]").first)
 
-    # 2) Enlace/pestaña extra de tutorías, solo si se ha configurado
+    # Enlace/pestaña extra de tutorías, solo si se ha configurado
     if TUTORIAS:
         r = await web._click_if_visible(page, TUTORIAS, timeout=8000)
         if not r:
-            await page.screenshot(path=str(OUT / "error_tutorias.png"), full_page=True)
-            await show_buttons(page, f"No encuentro '{TUTORIAS}' (mira error_tutorias.png).")
+            await page.screenshot(path=str(outdir / "error_tutorias.png"), full_page=True)
+            await show_buttons(page, f"No encuentro '{TUTORIAS}'.")
             raise web.WebError("Revisa WEB_TUTORIAS en .env.")
-    if first:
-        await page.screenshot(path=str(OUT / "1_tutorias.png"), full_page=True)
+    await page.screenshot(path=str(outdir / "1_tutorias.png"), full_page=True)
 
-    # 3) Lista de tutorías
     fr, theaders, trows = await mark_list(page)
-    return ctx, page, nombre, fr, theaders, trows
+    return page, nombre, fr, theaders, trows, len(rows)
 
 
 def print_tutoria(n: int, label: str, forms: list, text: str) -> None:
@@ -304,18 +398,333 @@ def print_tutoria(n: int, label: str, forms: list, text: str) -> None:
     campos = [c for f in forms for c in f["campos"]]
     if not campos:
         print("   (No hay campos de formulario; texto de la página:)")
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        for l in lines[:30]:
+        for l in page_lines(text)[:30]:
             print(f"     {l[:100]}")
         return
     for c in campos[:50]:
-        aviso = ""
-        if c["obligatorio"] and not c["valor"]:
-            aviso = "  ⚠ obligatorio vacío"
-        elif not c["valor"]:
-            aviso = "  (vacío)"
+        aviso = "  (vacío)" if not c["valor"] else ""
         valor = c["valor"][:90] + ("…" if len(c["valor"]) > 90 else "")
         print(f"     {c['campo'] or '(sin nombre)'}: {valor}{aviso}")
+
+
+def page_lines(text: str) -> list[str]:
+    return [l.strip() for l in (text or "").splitlines() if l.strip()]
+
+
+async def find_button(page: Page, text: str, ms: int = 2500):
+    for _ in range(max(1, ms // 500)):
+        el = await web._find_visible(page, text)
+        if el:
+            return el
+        await page.wait_for_timeout(500)
+    return None
+
+
+async def read_desarrollos(page: Page, outdir: Path):
+    """Pulsa "Desarrollos asociados" si está en esta página y devuelve (texto, página_resultado).
+    texto = None si el botón no está aquí; "" si está pero no hay texto."""
+    el = await find_button(page, DESARROLLOS)
+    if not el:
+        if SOLO_DES:
+            print(f"   🔎 No veo '{DESARROLLOS}' en: {await page.title()}  ({page.url})")
+            botones = await web.list_clickables(page)
+            if botones:
+                print("      Botones/enlaces que hay en esa pantalla:")
+                for b in botones:
+                    print(f"        - {b}")
+        return None, page
+    forms_before, _, before = await read_page(page)
+    url_before = page.url
+    before_vals = {(c["valor"] or "").strip() for f in forms_before for c in f["campos"]}
+    log.info("Pulsando '%s'", DESARROLLOS)
+    target = await click_follow(page, el)
+    # ¿Se ha abierto dentro de la misma página (capa/ventanita)? Entonces hay que quitar lo que ya estaba.
+    misma = target is page and target.url == url_before
+
+    # El texto puede cargarse un poco después: se reintenta unos segundos si sale vacío.
+    texto, forms, tables, after = "", [], [], ""
+    for intento in range(4):
+        forms, tables, after = await read_page(target)
+        headers = await table_headers(target)
+        texto = extract_desarrollos(forms, tables, after, before, before_vals, misma, headers)
+        if texto:
+            break
+        await target.wait_for_timeout(1500)
+    await target.screenshot(path=str(outdir / "desarrollos.png"), full_page=True)
+
+    # Lo leído se guarda para poder revisarlo si algo no cuadra
+    campos_txt = [c for f in forms for c in f["campos"] if c["tipo"] in ("textarea", "text")]
+    (outdir / "desarrollos_leido.txt").write_text(
+        f"URL: {target.url}\nMisma página: {misma}\n\n--- CAMPOS DE TEXTO ---\n"
+        + "\n".join(f"{c['campo'] or '(sin nombre)'}: {c['valor'] or '(vacío)'}" for c in campos_txt)
+        + "\n\n--- TABLAS ---\n"
+        + "\n".join(" | ".join(r) for t in tables for r in t["filas"])
+        + "\n\n--- TEXTO DE LA PÁGINA ---\n" + after
+        + "\n\n--- RESULTADO ---\n" + (texto or "(vacío)"), encoding="utf-8")
+
+    if SOLO_DES:
+        print(f"   🔎 Tras pulsar, estoy en: {await target.title()}  ({target.url})")
+        print(f"      Captura: {(outdir / 'desarrollos.png').resolve()}")
+        print(f"      Todo lo leído: {(outdir / 'desarrollos_leido.txt').resolve()}")
+        if campos_txt:
+            print("      Campos de texto:")
+            for c in campos_txt:
+                print(f"        - {c['campo'] or '(sin nombre)'}: {(c['valor'] or '(vacío)')[:110]}")
+    return texto, target
+
+
+# Textos de las cabeceras de todas las tablas, también de las vacías
+HEADERS_JS = r"""
+() => {
+  const out = [];
+  for (const t of document.querySelectorAll('table')) {
+    const rows = [...t.rows];
+    if (!rows.length) continue;
+    const head = t.querySelector('thead tr') || rows.find(r => r.querySelector('th'))
+                 || (rows.length === 1 ? rows[0] : null);
+    if (head) for (const c of head.cells) { const x = c.innerText.trim(); if (x) out.push(x); }
+  }
+  return out;
+}
+"""
+
+
+async def table_headers(p: Page) -> list[str]:
+    out = []
+    for fr in p.frames:
+        try:
+            out += await fr.evaluate(HEADERS_JS)
+        except Exception:
+            pass
+    return out
+
+
+RUIDO_RE = re.compile(r"^(volver|guardar|aceptar|cancelar|cerrar|imprimir|salir|buscar|nuevo|"
+                      r"a[ñn]adir|editar|eliminar|borrar)$", re.I)
+
+
+def extract_desarrollos(forms, tables, after, before, before_vals, misma, headers=()) -> str:
+    """Saca el texto de los desarrollos: campos rellenos + filas de tablas + (si no hay nada) texto nuevo."""
+    prev = set(page_lines(before))
+
+    def ya_estaba(v):           # solo se filtra si es la misma página (capa/ventanita)
+        return misma and (v in before_vals or v in before)
+
+    # 1) Campos de texto rellenos (los vacíos, como un buscador, se ignoran)
+    campos = []
+    for f in forms:
+        for c in f["campos"]:
+            v = (c["valor"] or "").strip()
+            if (c["tipo"] in ("textarea", "text") and v and not SIN_NOTA_RE.match(v)
+                    and not NO_NOTA_VALOR_RE.search(v) and not ya_estaba(v)):
+                campos.append((c["campo"], v))
+    parts = [f"{k}: {v}" if k and len(campos) > 1 else v for k, v in campos]
+    sp = lambda x: re.sub(r"\s+", " ", x).strip()        # compara sin tener en cuenta saltos de línea
+    vals = sp(" ".join(v for _, v in campos))
+
+    # 2) Filas de tablas (p. ej. una lista de desarrollos)
+    for t in tables:
+        for row in t["filas"]:
+            cells = [x for x in row if x and not x.endswith(":") and not RUIDO_RE.match(x)]
+            if not cells or all(sp(x) in vals for x in cells):
+                continue                      # vacía o ya incluida como campo
+            nueva = not all(x in prev for x in cells)
+            # Si la página es otra, una fila con contenido se guarda aunque también saliera antes
+            con_contenido = not misma and len(cells) >= 2 and len(" ".join(cells)) > 40
+            if nueva or con_contenido:
+                parts.append(" | ".join(cells))
+
+    # 3) Si no hay nada, el texto nuevo de la página (sin las cabeceras de tablas vacías)
+    if not parts:
+        cabeceras = {h.strip().lower() for h in headers if h.strip()}
+        cabeceras |= {h.strip().lower() for t in tables for h in t.get("cabeceras", []) if h.strip()}
+
+        def es_cabecera(l):
+            trozos = [x.strip().lower() for x in re.split(r"\t+|\s{2,}", l) if x.strip()]
+            return bool(trozos) and all(x in cabeceras for x in trozos)
+
+        parts = [l for l in page_lines(after)
+                 if l not in prev and DESARROLLOS.lower() not in l.lower()
+                 and len(l) > 2 and not l.endswith(":") and not RUIDO_RE.match(l)
+                 and not es_cabecera(l)]
+    return "\n".join(dict.fromkeys(parts))
+
+
+async def process_student(ses: Sesion, idx: int, first: bool) -> dict:
+    """Revisa un alumno. Devuelve un dict con todo lo encontrado."""
+    outdir = OUT / f"{idx + 1:02d}"
+    outdir.mkdir(parents=True, exist_ok=True)
+    page, nombre, fr, theaders, trows, n_alumnos = await open_tutorias(ses, idx, outdir, first)
+    res = {"n": idx + 1, "alumno": nombre, "n_alumnos": n_alumnos, "tutorias": [],
+           "estado": "ok", "desarrollos": None}
+    print(f"\n━━━━━━━━ 👤 {idx + 1}/{n_alumnos}: {nombre} ━━━━━━━━")
+    try:
+        async def back_to_list():
+            """Vuelve a la lista de tutorías (atrás o, si no se puede, entrando de nuevo)."""
+            nonlocal page, fr
+            fr, _, rows_now = await mark_list(page)
+            if rows_now == trows:
+                return
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=15000)
+                await web._settle(page)
+            except Exception:
+                pass
+            fr, _, rows_now = await mark_list(page)
+            if rows_now != trows:
+                log.info("No puedo volver atrás; vuelvo a entrar en el alumno desde la lista")
+                page, _, fr, _, _, _ = await open_tutorias(ses, idx, outdir)
+
+        # 1) "Desarrollos asociados" en la página de tutorías del alumno
+        texto, target = await read_desarrollos(page, outdir)
+        if texto is not None:
+            res["desarrollos"] = texto
+            if target is not page:
+                await target.close()
+            if trows:
+                await back_to_list()
+
+        # 2) Tutoría(s) a revisar
+        if SOLO_DES and res["desarrollos"] is not None:
+            pass        # ya está: en este modo no hace falta mirar las tutorías
+        elif not trows:
+            res["estado"] = "sin_tutorias"
+            print("   No hay tutorías (o no encuentro la lista).")
+        else:
+            print(f"📚 {len(trows)} tutoría(s):")
+            for i, r in enumerate(trows, 1):
+                print(f"     {i}. {' | '.join(c for c in r if c)}")
+            if TODAS:
+                indices = list(range(len(trows)))
+            else:
+                i_next, fecha = next_tutoria(trows, HOY)
+                if i_next is None and SOLO_DES:
+                    indices = [len(trows) - 1]   # solo para buscar el botón dentro de una tutoría
+                elif i_next is None:
+                    res["estado"] = "sin_fechas" if fecha == "sin_fechas" else "sin_proxima"
+                    indices = []
+                else:
+                    print(f"📅 Reviso la más próxima: nº {i_next + 1} ({fecha:%d/%m/%Y})")
+                    indices = [i_next]
+
+            for k, i in enumerate(indices):
+                if k > 0:
+                    await back_to_list()
+                label = " | ".join(c for c in trows[i] if c)[:100]
+                ic = await fr.evaluate(ICON_JS, [i, ICONO_TUTORIA, COL_TUTORIA])
+                if ic.get("error"):
+                    print(f"⚠️  Tutoría {i + 1}: {ic['error']}")
+                    for x in ic.get("info", []):
+                        print(f"     - {x}")
+                    res["tutorias"].append({"tutoria": i + 1, "fila": label, "error": ic["error"]})
+                    continue
+                log.info("Abriendo tutoría %d: %s", i + 1, ic["picked"])
+                target = await click_follow(page, fr.locator("[data-iw-click]").first)
+                await target.screenshot(path=str(outdir / f"tutoria_{i + 1}.png"), full_page=True)
+                forms, tables, text = await read_page(target)
+                if not SOLO_DES:
+                    print_tutoria(i + 1, label, forms, text)
+                res["tutorias"].append({"tutoria": i + 1, "fila": label, "url": target.url,
+                                        "formularios": forms, "tablas": tables, "texto": text})
+                # "Desarrollos asociados" en la propia tutoría, si no estaba en la lista
+                if res["desarrollos"] is None:
+                    texto, t2 = await read_desarrollos(target, outdir)
+                    if texto is not None:
+                        res["desarrollos"] = texto
+                        if t2 is not target and t2 is not page:
+                            await t2.close()
+                if target is not page:
+                    await target.close()
+    finally:
+        pass
+
+    (outdir / "datos.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    return res
+
+
+# Qué campos son observaciones y cuáles no son "ítems con nota" (datos generales).
+OBS_RE = re.compile(os.getenv("WEB_CAMPOS_OBSERVACIONES", r"observ|coment|valoraci[oó]n general"), re.I)
+NO_NOTA_RE = re.compile(os.getenv(
+    "WEB_CAMPOS_EXCLUIR",
+    r"fecha|hora|tipo|centro|curso|ciclo|nombre|apellido|documento|dni|nif|buscar|periodo|empresa|"
+    r"^tutor$|lugar|modalidad"), re.I)
+SIN_NOTA_RE = re.compile(r"^(seleccione.*|elija.*|-+|ninguna?|no marcado|sin calificar|0?)$", re.I)
+# Valores que son datos de cabecera (curso, centro…) y no notas
+NO_NOTA_VALOR_RE = re.compile(r"^\d{4}/\d{2,4}$|^(IES|CPIFP|CIFP|CPI|CPEPA|COLEGIO|CENTRO)\b", re.I)
+
+
+def split_fields(campos: list) -> tuple[list, list]:
+    """Separa los campos en (ítems con nota, observaciones)."""
+    notas, obs, vistos = [], [], set()
+    for c in campos:
+        nombre_campo, valor = c["campo"] or "", (c["valor"] or "").strip()
+        if (nombre_campo, valor) in vistos:
+            continue
+        vistos.add((nombre_campo, valor))
+        if OBS_RE.search(nombre_campo):
+            obs.append((nombre_campo, valor))
+        elif valor and not SIN_NOTA_RE.match(valor) and not NO_NOTA_RE.search(nombre_campo) \
+                and not NO_NOTA_VALOR_RE.search(valor) \
+                and c["tipo"] not in ("textarea", "date"):
+            notas.append((nombre_campo or "(sin nombre)", "✔" if valor == "marcado" else valor))
+    return notas, obs
+
+
+def build_message(r: dict) -> str:
+    """Mensaje de Telegram de UN alumno."""
+    lines = [f"👤 {r['alumno']}"]
+    if r.get("error"):
+        lines.append(f"❓ No he podido revisarlo: {r['error']}")
+        return "\n".join(lines)
+    if SOLO_DES:
+        lines += ["", "📎 DESARROLLOS",
+                  "(no he encontrado el botón)" if r["desarrollos"] is None else (r["desarrollos"] or "No hay texto.")]
+        return "\n".join(lines)
+
+    estados = {
+        "sin_tutorias": "📭 No hay tutorías.",
+        "sin_proxima": f"📭 No hay ninguna tutoría a partir del {HOY:%d/%m/%Y}.",
+        "sin_fechas": "📭 No he encontrado fechas en sus tutorías.",
+    }
+    if r["estado"] in estados:
+        lines.append(estados[r["estado"]])
+
+    for t in r["tutorias"]:
+        lines += ["", f"📅 {'Tutoría' if TODAS else 'Próxima tutoría'}: {t['fila'][:60]}"]
+        if t.get("error"):
+            lines.append(f"❓ No he podido abrirla: {t['error']}")
+            continue
+        notas, obs = split_fields([c for f in t.get("formularios", []) for c in f["campos"]])
+        if not notas and not any(v for _, v in obs):
+            lines.append("📭 No hay datos.")
+            continue
+        if notas:
+            lines.append("📝 Notas:")
+            lines += [f"• {k}: {v}" for k, v in notas]
+        lines += ["", "💬 OBSERVACIONES"]
+        if not obs:
+            lines.append("(no he encontrado campos de observaciones)")
+        for k, v in obs:
+            if v:
+                lines += [f"▸ {k}:", v, ""]
+        sin_obs = [k for k, v in obs if not v]
+        if sin_obs:
+            lines.append("Sin rellenar: " + ", ".join(sin_obs))
+        while lines and lines[-1] == "":
+            lines.pop()
+
+    lines += ["", "📎 DESARROLLOS"]
+    if r["desarrollos"] is None:
+        lines.append("(no he encontrado el botón)")
+    else:
+        lines.append(r["desarrollos"] or "No hay texto.")
+    return "\n".join(lines)
+
+
+def alumno_nombre(ses: "Sesion", idx: int) -> str:
+    if ses.alumnos and idx < len(ses.alumnos):
+        return ses.alumnos[idx]
+    return f"Alumno {idx + 1}"
 
 
 async def main() -> int:
@@ -323,160 +732,65 @@ async def main() -> int:
         print("Falta rellenar en .env: WEB_LOGIN_URL, WEB_USER y WEB_PASSWORD")
         return 1
     OUT.mkdir(exist_ok=True)
+    if not SIN_ENVIAR and not notificar.channels():
+        print("⚠️  No hay Telegram configurado en .env: solo lo mostraré en pantalla.")
 
+    resumen = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=not VISIBLE, slow_mo=150 if VISIBLE else 0)
-        try:
-            ctx, page, nombre, fr, theaders, trows = await open_tutorias(browser, first=True)
-        except web.WebError as e:
-            print(f"\n❌ {e}")
-            await browser.close()
-            return 1
-
-        if not trows:
-            await page.screenshot(path=str(OUT / "error_lista_tutorias.png"), full_page=True)
-            print(f"\n❌ He entrado en {nombre}, pero no encuentro la lista de tutorías con iconos.")
-            print("   Mira 1_tutorias.png y pásamela para ajustarlo. Texto de la página:")
-            _, _, text = await read_page(page)
-            for l in [l.strip() for l in text.splitlines() if l.strip()][:40]:
-                print(f"     {l[:100]}")
-            if VISIBLE:
-                input("\nPulsa Enter para cerrar el navegador…")
-            await browser.close()
-            return 1
-
-        n = len(trows)
-        print(f"\n📚 {n} tutoría(s) de {nombre}:   [{' | '.join(h for h in theaders if h)}]")
-        for i, r in enumerate(trows, 1):
-            print(f"     {i}. {' | '.join(c for c in r if c)}")
-
-        # ¿Cuáles revisar? Por defecto, solo la más próxima a partir de hoy.
-        if TODAS:
-            indices = list(range(n))
-        else:
-            idx, fecha = next_tutoria(trows, HOY)
-            if idx is None:
+        browser = await p.chromium.launch(headless=not VISIBLE, slow_mo=100 if VISIBLE else 0)
+        ses = Sesion(browser)
+        alumno = ALUMNO
+        if NOMBRE:
+            try:
+                await ses.ir_a_lista()
+            except web.WebError as e:
+                print(f"\n❌ {e}")
                 await browser.close()
-                msg = (f"📋 {nombre}\nNo hay ninguna tutoría a partir del {HOY:%d/%m/%Y}."
-                       if fecha != "sin_fechas" else
-                       f"📋 {nombre}\nNo he encontrado fechas en la lista de tutorías.")
-                print("\n" + msg)
+                return 1
+            buscados = [k for k, n in enumerate(ses.alumnos) if _norm(NOMBRE) in _norm(n)]
+            if len(buscados) != 1:
+                print(f"\n❌ '{NOMBRE}' coincide con {len(buscados)} alumnos. Lista:")
+                for k, n in enumerate(ses.alumnos, 1):
+                    print(f"     {k}. {n}")
+                await browser.close()
+                return 1
+            alumno = buscados[0] + 1
+            print(f"\n🎯 Alumno elegido: {ses.alumnos[buscados[0]]} (nº {alumno})")
+        idx = (alumno - 1) if alumno else 0
+        total = None
+        first = True
+        while total is None or idx < total:
+            try:
+                r = await process_student(ses, idx, first)
+                total = idx + 1 if alumno else r["n_alumnos"]
+            except web.WebError as e:
+                if first:          # si falla el primero, es un problema general: parar
+                    print(f"\n❌ {e}")
+                    await browser.close()
+                    return 1
+                r = {"n": idx + 1, "alumno": alumno_nombre(ses, idx), "error": str(e)}
+            except Exception as e:
+                log.exception("Error inesperado")
+                if total is None:
+                    await browser.close()
+                    return 1
+                r = {"n": idx + 1, "alumno": alumno_nombre(ses, idx), "error": str(e)}
+            first = False
+
+            msg = build_message(r)
+            print("\n----- Mensaje -----\n" + msg + "\n-------------------")
+            if not SIN_ENVIAR:
                 for line in notificar.send(msg):
                     print(line)
-                return 0
-            print(f"\n📅 Hoy es {HOY:%d/%m/%Y}: reviso solo la más próxima, la nº {idx + 1} ({fecha:%d/%m/%Y}).")
-            indices = [idx]
-
-        resultados = []
-        for k, i in enumerate(indices):
-            if k > 0:
-                # Volver a la lista de tutorías
-                fr, _, rows_now = await mark_list(page)
-                if rows_now != trows:
-                    try:
-                        await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                        await web._settle(page)
-                    except Exception:
-                        pass
-                    fr, _, rows_now = await mark_list(page)
-                if rows_now != trows:
-                    log.info("No puedo volver atrás; vuelvo a entrar desde el principio")
-                    await ctx.close()
-                    ctx, page, _, fr, _, rows_now = await open_tutorias(browser, first=False)
-
-            label = " | ".join(c for c in trows[i] if c)[:100]
-            res = await fr.evaluate(ICON_JS, [i, ICONO_TUTORIA, COL_TUTORIA])
-            if res.get("error"):
-                print(f"\n⚠️  Tutoría {i + 1}: {res['error']}. Elementos de la fila:")
-                for x in res.get("info", []):
-                    print(f"     - {x}")
-                resultados.append({"tutoria": i + 1, "fila": label, "error": res["error"]})
-                continue
-            log.info("Abriendo tutoría %d: %s", i + 1, res["picked"])
-            target = await click_follow(page, fr.locator("[data-iw-click]").first)
-            await target.screenshot(path=str(OUT / f"tutoria_{i + 1}.png"), full_page=True)
-            forms, tables, text = await read_page(target)
-            print_tutoria(i + 1, label, forms, text)
-            resultados.append({"tutoria": i + 1, "fila": label, "url": target.url,
-                               "formularios": forms, "tablas": tables, "texto": text})
-            if target is not page:
-                await target.close()
-
-        if VISIBLE:
-            input("\nPulsa Enter para cerrar el navegador y enviar el mensaje…")
+                await asyncio.sleep(1)   # no saturar Telegram
+            resumen.append(r)
+            idx += 1
+        log.info("Inicios de sesión en la web: %d", ses.logins)
+        await ses.close()
         await browser.close()
 
-    # --- Guardar datos y enviar el mensaje ---
-    (OUT / "datos.json").write_text(json.dumps(
-        {"alumno": nombre, "tutorias": resultados}, ensure_ascii=False, indent=1), encoding="utf-8")
-
-    mensaje = build_message(nombre, resultados)
-    review = ai_summary(nombre, resultados)
-    if review:
-        mensaje += "\n\n🤖 Revisión de la IA:\n" + review
-
-    print(f"\n✅ Revisadas {len(resultados)} tutoría(s) de {nombre}.")
-    print("\n----- Mensaje -----\n" + mensaje + "\n-------------------")
-    for line in notificar.send(mensaje):
-        print(line)
+    print(f"\n✅ Revisados {len(resumen)} alumno(s). Capturas y datos en: {OUT.resolve()}")
     return 0
-
-
-def build_message(nombre: str, resultados: list) -> str:
-    """Resumen corto para el móvil: qué tutorías tienen campos vacíos."""
-    titulo = f"Tutorías de {nombre} ({len(resultados)})" if TODAS else f"Próxima tutoría de {nombre}"
-    lines = [f"📋 {titulo}", ""]
-    con_avisos = 0
-    for r in resultados:
-        cab = f"Tutoría {r['tutoria']} · {r['fila'][:50]}"
-        if r.get("error"):
-            lines.append(f"❓ {cab}\n   No he podido abrirla: {r['error']}")
-            con_avisos += 1
-            continue
-        campos = [c for f in r.get("formularios", []) for c in f["campos"]]
-        oblig = [c["campo"] or "(sin nombre)" for c in campos if c["obligatorio"] and not c["valor"]]
-        vacios = [c["campo"] or "(sin nombre)" for c in campos if not c["obligatorio"] and not c["valor"]]
-        if not campos:
-            lines.append(f"❓ {cab}\n   No he encontrado campos de formulario")
-            con_avisos += 1
-        elif oblig or vacios:
-            con_avisos += 1
-            lines.append(f"⚠️ {cab}")
-            if oblig:
-                lines.append(f"   Obligatorios vacíos: {', '.join(oblig)}")
-            if vacios:
-                lines.append(f"   Vacíos: {', '.join(vacios)}")
-        else:
-            lines.append(f"✅ {cab}")
-    lines.insert(1, "Todo completo 👍" if not con_avisos else f"{con_avisos} con avisos")
-    return "\n".join(lines)
-
-
-def ai_summary(nombre: str, resultados: list) -> str | None:
-    """Revisión breve de la IA (solo si hay ANTHROPIC_API_KEY en .env)."""
-    if not informe.ANTHROPIC_API_KEY:
-        return None
-    print("\nLa IA está revisando las tutorías…")
-    datos = [{"tutoria": r["tutoria"], "fila": r["fila"],
-              "campos": [{k: c[k] for k in ("campo", "valor", "obligatorio")}
-                         for f in r.get("formularios", []) for c in f["campos"]]}
-             for r in resultados]
-    try:
-        from anthropic import Anthropic
-        resp = Anthropic(api_key=informe.ANTHROPIC_API_KEY).messages.create(
-            model=informe.MODEL, max_tokens=800,
-            system=("Revisas tutorías del cuaderno de seguimiento de FCT. Escribe en español un "
-                    "resumen MUY breve para un mensaje de móvil: texto plano, sin Markdown, sin "
-                    "tablas, máximo 8 líneas. Señala solo problemas concretos (campos vacíos, "
-                    "fechas u horas incoherentes, observaciones ausentes o pobres) indicando el "
-                    "nº de tutoría. Si todo está bien, dilo en una línea. No inventes datos."),
-            messages=[{"role": "user", "content":
-                       f"Alumno: {nombre}\n{INSTRUCCIONES}\n\n" + json.dumps(datos, ensure_ascii=False)}],
-        )
-        return "".join(b.text for b in resp.content if b.type == "text").strip()
-    except Exception as e:
-        print(f"AVISO: la revisión de la IA ha fallado ({e}).")
-        return None
 
 
 if __name__ == "__main__":
